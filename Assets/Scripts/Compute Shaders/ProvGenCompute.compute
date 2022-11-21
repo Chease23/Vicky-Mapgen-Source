@@ -1,0 +1,161 @@
+#pragma kernel Split
+#pragma kernel Borders
+#pragma kernel Recombine
+#pragma kernel Apply
+#pragma kernel Replace
+#include "WhiteNoise.cginc"
+
+int CellSize;
+int Width;
+int PixelWidth;
+int PixelHeight;
+float WaterHeight;
+float2 Offset;
+RWStructuredBuffer<float2> CellPositions;
+RWTexture2D<float4> Result;
+RWStructuredBuffer<int> Indices;
+RWTexture2D<float4> Cut;
+RWTexture2D<float4> Combined;
+Texture2D Heightmap;
+Texture2D BorderMap;
+RWStructuredBuffer<int> Done;
+StructuredBuffer<float4> ColorBuffer;
+
+[numthreads(8, 8, 1)]
+void Split(uint3 id : SV_DispatchThreadID)
+{
+    if (Heightmap[id.xy].x > WaterHeight)
+    {
+        float2 baseCell = float2(floor(id.x / CellSize), floor(id.y / CellSize));
+
+        float minDistToCell = CellSize * 3;
+        float2 closestCell;
+        float2 closestCellPos;
+        [unroll]
+        for (int x = -1; x <= 1; x++) {
+            [unroll]
+            for (int y = -1; y <= 1; y++) {
+                float2 cell = baseCell + float2(x, y);
+                float2 cellPosition = cell + rand2dTo2d(cell + Offset);
+                float2 toCell = cellPosition * CellSize - id.xy;
+                float distToCell = length(toCell);
+                if (distToCell < minDistToCell) {
+                    minDistToCell = distToCell;
+                    closestCell = cell;
+                    closestCellPos = cellPosition * CellSize;
+                }
+            }
+        }
+        int cellsWide = Width + 2;
+        float cellIndex = closestCell.x + 1 + cellsWide * (closestCell.y + 1);
+        cellIndex += 1;
+        
+        float r = (cellIndex % 256) / 255.0;
+        float g = (floor(cellIndex / 256.0) % 256) / 255.0;
+        float b = (floor(cellIndex / 65536.0) % 256) / 255.0;
+
+        Result[id.xy] = float4(r, g, b, 1);
+        CellPositions[cellIndex] = closestCellPos;
+        Indices[id.x + id.y * PixelWidth] = cellIndex;
+    }
+    else
+    {
+        Result[id.xy] = float4(0, 0, 0, 1);
+    }
+}
+
+[numthreads(8, 8, 8)]
+void Borders(uint3 id : SV_DispatchThreadID)
+{
+    float4 ocol = Result[id.xy];
+    if (ocol.x != 0.0 || ocol.y != 0.0 || ocol.z != 0.0)
+    {
+        int cellIndex = Indices[id.x + id.y * PixelWidth];
+        float2 cellPos = CellPositions[cellIndex];
+        float2 toCell = float2(id.xy) - cellPos;
+        int maxDist = CellSize * 2;
+        float2 delta = (toCell / maxDist) * id.z;
+        float2 checkPos = cellPos + delta;
+        if (sign(toCell.x) == sign(float(id.x) - (cellPos.x + delta.x)) &&
+            sign(toCell.y) == sign(float(id.y) - (cellPos.y + delta.y)))
+        {
+            if (checkPos.x >= 0 && checkPos.y >= 0 && checkPos.x < PixelWidth && checkPos.y < PixelHeight &&
+                ((BorderMap[uint2(checkPos)].x == 0 || BorderMap[uint2(checkPos)].y == 0 || BorderMap[uint2(checkPos)].z == 0) ||
+                Heightmap[checkPos].x < WaterHeight ))
+            {
+                Cut[id.xy] = float4(1, 0, 0, 1);
+            }
+        }
+    }
+}
+
+[numthreads(8, 8, 1)]
+void Recombine(uint3 id : SV_DispatchThreadID)
+{
+    float4 s0 = Cut[id.xy + uint2(1, 0)];
+    float4 s1 = Cut[id.xy + uint2(-1, 0)];
+    float4 s2 = Cut[id.xy + uint2(0, 1)];
+    float4 s3 = Cut[id.xy + uint2(0, -1)];
+    float4 col = Result[id.xy];
+    if (BorderMap[id.xy].x != 0 || BorderMap[id.xy].y != 0 || BorderMap[id.xy].x != 0)
+    {
+        if ((col.x != 0 || col.y != 0 || col.z != 0) && Cut[id.xy].x != 1 && (s0.x == 1 || s1.x == 1 || s2.x == 1 || s3.x == 1))
+        {
+            int ind = 0;
+            uint2 s[4];
+            if (s0.x == 1)
+            {
+                s[ind] = id.xy + uint2(1, 0);
+                ind += 1;
+            }
+            if (s1.x == 1)
+            {
+                s[ind] = id.xy + uint2(-1, 0);
+                ind += 1;
+            }
+            if (s2.x == 1)
+            {
+                s[ind] = id.xy + uint2(0, 1);
+                ind += 1;
+            }
+            if (s3.x == 1)
+            {
+                s[ind] = id.xy + uint2(0, -1);
+                ind += 1;
+            }
+
+            int r = floor(rand2dTo1d(id.xy + Offset) * ind);
+            if (r != ind && s[r].x >= 0 && s[r].y >= 0 && s[r].x < PixelWidth && s[r].y < PixelHeight)
+            {
+                Combined[s[r]] = Result[id.xy];
+                Done[0] = 0;
+            }
+        }
+    }
+}
+
+[numthreads(8, 8, 1)]
+void Apply(uint3 id : SV_DispatchThreadID)
+{
+    float4 col = Combined[id.xy];
+    if (col.w != 0)
+    {
+        Result[id.xy] = col;
+        Cut[id.xy] = float4(0, 0, 0, 0);
+    }
+}
+
+[numthreads(8, 8, 1)]
+void Replace(uint3 id : SV_DispatchThreadID)
+{
+    float4 col = Result[id.xy];
+    if (col.x != 0 || col.y != 0 || col.z != 0)
+    {
+        int r = floor(col.r * 255 + 0.5);
+        int g = floor(col.g * 255 + 0.5) * 256;
+        int b = floor(col.b * 255 + 0.5) * 256 * 256;
+        int cellIndex = r + g + b;
+
+        Result[id.xy] = ColorBuffer[cellIndex];
+    }
+}
